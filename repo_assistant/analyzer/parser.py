@@ -8,7 +8,7 @@ import ast
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
-from .models import FileNode, ClassNode, FunctionNode, SymbolReference
+from .models import CallEdge, ClassNode, FileNode, FunctionNode, SymbolReference
 
 
 class GraphParser(ABC):
@@ -31,6 +31,123 @@ class GraphParser(ABC):
         Returns a list of SymbolReference objects.
         """
         pass
+
+    @abstractmethod
+    def extract_calls(
+        self, file_path: str, content: str
+    ) -> List[CallEdge]:
+        """
+        Extracts all function call edges from a source file.
+
+        Unlike extract_references(), which captures every name usage,
+        this method only records calls that occur *inside* a function or
+        method body. Each edge pairs the enclosing callable (caller) with
+        the function being called (callee).
+
+        Returns a list of CallEdge objects. Returns an empty list if the
+        file is not a supported language or has parse errors.
+        """
+        pass
+
+
+class _CallCollector(ast.NodeVisitor):
+    """
+    AST visitor that extracts (caller_scope, callee_name) pairs.
+
+    Scope tracking:
+      The visitor maintains two stacks as it descends into class and function
+      definitions. When a Call node is encountered, the current scope (the
+      innermost enclosing function + its class if any) is used as the caller.
+
+      _class_stack: Names of ClassDef nodes currently being visited.
+      _func_stack:  Names of FunctionDef / AsyncFunctionDef nodes being visited.
+
+    Scope construction:
+      Inside class Foo, method bar  →  "Foo.bar"
+      Inside top-level function baz →  "baz"
+      At module level               →  None (calls are skipped)
+
+    Only the INNERMOST class and function are used. Calls inside nested
+    functions are attributed to the nested function's scope (which the
+    engine will silently ignore if it isn't a registered top-level node).
+
+    Decorator calls:
+      Decorator expressions (e.g. @app.route) are visited after the function
+      name is pushed onto the stack, so they appear as outgoing calls from
+      that function. This is a known simplification: it means a decorated
+      function will show the decorator as a callee. This matches the
+      behaviour of simple static analysis tools.
+    """
+
+    def __init__(self, file_path: str) -> None:
+        self.file_path = file_path
+        self.edges: List[CallEdge] = []
+        self._class_stack: List[str] = []
+        self._func_stack: List[str] = []
+
+    @property
+    def _current_scope(self) -> Optional[str]:
+        """
+        Returns the current caller scope, or None if not inside any function.
+
+        Examples:
+          Inside Flask.login      → "Flask.login"
+          Inside top-level route  → "route"
+          At module level         → None
+        """
+        if not self._func_stack:
+            return None
+        parts = []
+        if self._class_stack:
+            parts.append(self._class_stack[-1])
+        parts.append(self._func_stack[-1])
+        return ".".join(parts)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._class_stack.append(node.name)
+        self.generic_visit(node)
+        self._class_stack.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._func_stack.append(node.name)
+        self.generic_visit(node)
+        self._func_stack.pop()
+
+    # Async functions behave identically to sync functions for call graph purposes.
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Call(self, node: ast.Call) -> None:
+        """
+        Records a call edge when a Call node is found inside a function scope.
+
+        Recognised call patterns:
+          foo()          → callee_name = "foo"
+          obj.method()   → callee_name = "method"
+          module.Class() → callee_name = "Class"
+
+        Complex expressions (e.g. func_factory()()) are skipped because the
+        callee cannot be reduced to a simple name without evaluation.
+        """
+        scope = self._current_scope
+        if scope is not None:
+            func = node.func
+            if isinstance(func, ast.Name):
+                self.edges.append(CallEdge(
+                    caller_scope=scope,
+                    callee_name=func.id,
+                    line=node.lineno,
+                    file_path=self.file_path,
+                ))
+            elif isinstance(func, ast.Attribute):
+                self.edges.append(CallEdge(
+                    caller_scope=scope,
+                    callee_name=func.attr,
+                    line=node.lineno,
+                    file_path=self.file_path,
+                ))
+            # Complex expressions (e.g. a()()) are intentionally ignored.
+        # Always descend to capture nested calls.
+        self.generic_visit(node)
 
 
 class _ReferenceCollector(ast.NodeVisitor):
@@ -193,6 +310,35 @@ class ASTPythonParser(GraphParser):
         collector = _ReferenceCollector(file_path, source_lines)
         collector.visit(tree)
         return collector.refs
+
+    def extract_calls(self, file_path: str, content: str) -> List[CallEdge]:
+        """
+        Extracts all function call edges from a Python source file.
+
+        Uses _CallCollector to walk the entire AST and attribute each call
+        site to its enclosing function scope. Module-level calls (outside any
+        function) are excluded — they represent initialization code, not
+        runtime callable relationships.
+
+        Args:
+            file_path: Path to the source file (used in CallEdge metadata).
+            content:   Full source code.
+
+        Returns:
+            List of CallEdge objects. Empty if not a Python file or if the
+            file has a syntax error.
+        """
+        if not file_path.endswith('.py'):
+            return []
+
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return []
+
+        collector = _CallCollector(file_path)
+        collector.visit(tree)
+        return collector.edges
 
     def _parse_class(self, node: ast.ClassDef) -> ClassNode:
         bases = []
